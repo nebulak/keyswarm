@@ -14,6 +14,10 @@ import pyblake2
 import pylibscrypt
 import ed25519
 import base58
+import hashlib
+import time
+import json
+import base64
 
 import socks
 
@@ -40,36 +44,129 @@ class KeySwarmSession(object):
         hashed_pw = pyblake2.blake2s(pw).digest()
         seed = pylibscrypt.scrypt(hashed_pw, salt, 2**17, 8, 1, 32)
         self.private_key = ed25519.SigningKey(seed)
+        #print("test: " + str(self.private_key.sign(b"hello world", encoding="base64")))
         self.public_key = self.private_key.get_verifying_key()
         self.address = base58.b58encode( self.public_key.to_bytes() + pyblake2.blake2s(self.public_key.to_bytes(), 1).digest() )
-        print((self.address).decode('utf-8'))
+        print("Adress: ", (self.address).decode('utf-8'))
 
-ss = KeySwarmSession("test@example.com", "123455678999")
+
+
+
+class KeySwarmCrypto(object):
+    #//source: https://github.com/cathalgarvey/deadlock/blob/master/deadlock/crypto.py
+    @staticmethod
+    def ensure_bytes(value):
+        if isinstance(value, bytes):
+            return value
+        elif isinstance(value, str):
+            return value.encode('utf8')
+        elif isinstance(value, bytestring):
+            return bytes(value)
+        else:
+            raise TypeError("Value is not str, bytearray or bytes: '{}', type '{}'".format(value, type(value)))
+
+    @staticmethod
+    def assert_type_and_length(varname, var, T, L = None, minL = None, maxL = None):
+        'Facilitates simultaneous or one-line type/length checks.'
+        if not isinstance(var, T):
+            raise TypeError("Variable '{}' is supposed to be type '{}' but is '{}'".format(varname, T, type(var)))
+        if isinstance(L, int):
+            if not L == len(var):
+                raise ValueError("Variable '{}' is supposed to be length {} but is {}".format(varname, L, len(var)))
+        if isinstance(maxL, int):
+            if maxL < len(var):
+                raise ValueError("Variable '{}' is supposed to be smaller than {} but is length {}".format(varname, maxL, len(var)))
+        if isinstance(minL, int):
+            if minL > len(var):
+                raise ValueError("Variable '{}' is supposed to be larger than {} but is length {}".format(varname, minL, len(var)))
+
+    @staticmethod
+    def get_verifying_key_from_address(b58_address):
+        decoded_address = KeySwarmCrypto.ensure_bytes(base58.b58decode(b58_address))
+        # //TODO: length check
+        public_key = nacl.public.PublicKey(decoded_address[:-1])
+        check_sum = decoded[-1:]
+        if check_sum != pyblake2.blake2s(public_key.encode(), 1).digest():
+            raise ValueError("Public Key does not match its attached checksum byte: id='{}', decoded='{}', given checksum='{}', calculated checksum={}".format(b58_address, decoded_address, check_sum, pyblake2.blake2s(public_key.encode(), 1).digest()))
+        return public_key
+
+    @staticmethod
+    def get_file_sha512(file_path):
+        BLOCKSIZE = 65536
+        hasher = hashlib.sha512()
+        with open(file_path, 'rb') as afile:
+            buf = afile.read(BLOCKSIZE)
+            while len(buf) > 0:
+                hasher.update(buf)
+                buf = afile.read(BLOCKSIZE)
+        return hasher.hexdigest()
+
+
 
 class ProfileSigner(object):
     def __init__(self, ks_session, path):
         self.ks_session = ks_session
         self.path = path
+        self.metainfo_path = ""
+
+        self.metainfo_path = os.path.join(path, 'metainfo.json')
+        if not os.path.exists(self.metainfo_path):
+            with open(self.metainfo_path, 'w'): pass
+
 
     def sign(self):
         # //TODO: use this function to walk dir
         # https://www.bogotobogo.com/python/python_traversing_directory_tree_recursively_os_walk.php
-        path = "./TEST"
+        path = self.path
+        metaInfoContent = MetaInfoContent()
+        metaInfoContent.address = self.ks_session.address.decode('utf-8')
         fname = []
         for root,d_names,f_names in os.walk(path):
-        	for f in f_names:
-        		fname.append(os.path.join(root, f))
+            for f in f_names:
+                cur_file = os.path.join(root, f)
+                fname.append(cur_file)
+                #//TODO: fix for json encode
+                hashed_file = self.hash_file(cur_file)
+                file_dict = { "path" : hashed_file.path, "hash" : hashed_file.hash}
+                metaInfoContent.files.append(file_dict)
 
-        print("fname = %s" %fname)
+        print(json.dumps(metaInfoContent.files))
 
+        metaInfoContent.timestamp = int(time.time())
+        metaInfo = MetaInfo()
+        encoded_content = json.dumps(metaInfoContent.__dict__)
+        metaInfo.content = base64.b64encode(encoded_content.encode('utf-8')).decode('utf-8')
+        print(metaInfo.content)
+        meta_sign = self.ks_session.private_key.sign(encoded_content.encode('utf-8'), encoding='hex')
+        metaInfo.signature = ("sha512:" + meta_sign.decode('utf-8'))#.decode('utf-8')
+        print("sign: " + metaInfo.signature)
 
-    def sign_file(self, path):
-        pass
+        with open(self.metainfo_path, 'w') as meta_file:
+            meta_file.write(json.dumps(metaInfo.__dict__))
 
-class EncMetaInfo(object):
+        return True
+
+    def hash_file(self, path):
+        file_info = MetaInfoFileInfo()
+        file_info.path = path#.decode('utf-8')
+        file_info.hash = ("sha512:" + KeySwarmCrypto.get_file_sha512(path))#.decode('utf-8')
+        #print('pat: ' + file_info.path)
+        #print('hash: ' + file_info.hash)
+        return file_info
+
+class MetaInfo(object):
     def __init__(self):
         self.content = ""
         self.signature = ""
+
+    def load(self):
+        # //TODO: load from file
+        # //TODO: verify signature
+        pass
+
+    def save(self):
+        # //TODO: save to file
+        pass
 
 class MetaInfoContent(object):
     def __init__(self):
@@ -78,11 +175,21 @@ class MetaInfoContent(object):
         self.files = []
         self.timestamp = 0
 
-class MetaInfoFile(object):
+class MetaInfoFileInfo(object):
     def __init__(self):
         self.path = ""
         self.hash = ""
 
+
+class ProfileVerifier(object):
+    def __init__(self):
+        pass
+
+    def verify(self):
+        pass
+
+    def verify_file(self):
+        pass
 
 """
 def start_web_app():
@@ -150,3 +257,7 @@ def main():
 if __name__ == '__main__':
 main()
 """
+
+ss = KeySwarmSession("test@example.com", "123455678999")
+profileSigner = ProfileSigner(ss, "/home/buchhofe/Github/keyswarm/test")
+profileSigner.sign()
